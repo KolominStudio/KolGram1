@@ -55,9 +55,13 @@ function userPublic(u, forUserId) {
   };
 }
 
+/* ИСПРАВЛЕНО: приватный чат всегда разворачивается в отсортированный ключ */
 function chatKeyOf(target, meId) {
   if (target === 'saved') return 'saved_' + meId;
-  return target;
+  if (target === 'channel') return 'channel';
+  if (target.startsWith('g_') || target.startsWith('ch_')) return target;
+  if (target.includes('_')) return target; // уже готовый ключ (id_id)
+  return privateKey(meId, target);
 }
 function isMemberOf(chatKey, meId) {
   if (chatKey === 'channel') return true;
@@ -83,20 +87,13 @@ function participantsOf(chatKey, meId) {
   }
   if (chatKey.startsWith('ch_')) {
     const c = channels.find(x => x.id === chatKey);
-    if (!c) return [c ? c.owner_id : null].filter(Boolean);
+    if (!c) return [];
     const set = new Set([c.owner_id, ...(c.subs || [])]);
     return [...set];
   }
   if (chatKey.startsWith('saved_')) return [chatKey.replace('saved_', '')];
   const [a, b] = chatKey.split('_');
   return [a, b];
-}
-function chatIdForClient(chatKey, meId) {
-  if (chatKey === 'channel') return 'channel';
-  if (chatKey.startsWith('saved_')) return 'saved_' + meId;
-  if (chatKey.startsWith('g_') || chatKey.startsWith('ch_')) return chatKey;
-  const [a, b] = chatKey.split('_');
-  return a === meId ? b : a;
 }
 function pushMessage(chatKey, msg) {
   if (!messages[chatKey]) messages[chatKey] = [];
@@ -214,10 +211,7 @@ app.get('/api/overview', auth, (req, res) => {
   for (const key of Object.keys(raw)) {
     const parts = participantsOf(key, meId);
     if (!parts.includes(meId)) continue;
-    if (key.startsWith('ch_') && !isMemberOf(key, meId)) {
-      const c = channels.find(x => x.id === key);
-      if (!c || c.owner_id !== meId) continue;
-    }
+    if (key.startsWith('ch_') && !isMemberOf(key, meId)) continue;
     out[key] = raw[key];
   }
   res.json(out);
@@ -274,11 +268,16 @@ app.post('/api/send', auth, (req, res) => {
   pushMessage(key, msg);
   saveAll();
 
-  participantsOf(key, me.id).forEach(id => sendTo(id, { type: 'new_message', data: msg }));
+  /* ИСПРАВЛЕНО: не отправляем сообщение обратно отправителю —
+     он уже получил его в ответе /api/send, иначе оно дублировалось */
+  participantsOf(key, me.id)
+    .filter(id => id !== me.id)
+    .forEach(id => sendTo(id, { type: 'new_message', data: msg }));
   res.json({ msg });
 });
 
 app.post('/api/read', auth, (req, res) => {
+  /* ИСПРАВЛЕНО: теперь ключ считается так же, как при отправке */
   const key = chatKeyOf(String(req.body.to || ''), req.user.id);
   const arr = messages[key];
   if (arr) {
@@ -544,7 +543,6 @@ wss.on('connection', (ws) => {
       if (p.callType) out.callType = p.callType;
       if (p.duration != null) out.duration = p.duration;
       sendTo(target.id, out);
-      /* Записываем звонок в историю, когда кто-то завершил */
       if (p.type === 'call_end') {
         const meId = ws.userId;
         const key = privateKey(meId, target.id);
