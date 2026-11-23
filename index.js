@@ -55,12 +55,12 @@ function userPublic(u, forUserId) {
   };
 }
 
-/* ИСПРАВЛЕНО: приватный чат всегда разворачивается в отсортированный ключ */
+/* Приватный чат всегда разворачивается в отсортированный ключ */
 function chatKeyOf(target, meId) {
   if (target === 'saved') return 'saved_' + meId;
   if (target === 'channel') return 'channel';
   if (target.startsWith('g_') || target.startsWith('ch_')) return target;
-  if (target.includes('_')) return target; // уже готовый ключ (id_id)
+  if (target.includes('_')) return target;
   return privateKey(meId, target);
 }
 function isMemberOf(chatKey, meId) {
@@ -268,8 +268,6 @@ app.post('/api/send', auth, (req, res) => {
   pushMessage(key, msg);
   saveAll();
 
-  /* ИСПРАВЛЕНО: не отправляем сообщение обратно отправителю —
-     он уже получил его в ответе /api/send, иначе оно дублировалось */
   participantsOf(key, me.id)
     .filter(id => id !== me.id)
     .forEach(id => sendTo(id, { type: 'new_message', data: msg }));
@@ -277,7 +275,6 @@ app.post('/api/send', auth, (req, res) => {
 });
 
 app.post('/api/read', auth, (req, res) => {
-  /* ИСПРАВЛЕНО: теперь ключ считается так же, как при отправке */
   const key = chatKeyOf(String(req.body.to || ''), req.user.id);
   const arr = messages[key];
   if (arr) {
