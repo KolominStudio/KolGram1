@@ -24,7 +24,7 @@ function save(name, data) {
   fs.writeFileSync(path.join(DATA_DIR, name), JSON.stringify(data));
 }
 let users = load('users.json', []);
-let messages = load('messages.json', {}); // chatKey -> [msg]
+let messages = load('messages.json', {});
 let groups = load('groups.json', []);
 let channels = load('channels.json', []);
 let tokens = load('tokens.json', {});
@@ -60,6 +60,7 @@ function chatKeyOf(target, meId) {
   return target;
 }
 function isMemberOf(chatKey, meId) {
+  if (chatKey === 'channel') return true;
   if (chatKey.startsWith('g_')) {
     const g = groups.find(x => x.id === chatKey);
     return g && g.members.includes(meId);
@@ -73,6 +74,9 @@ function isMemberOf(chatKey, meId) {
   return true;
 }
 function participantsOf(chatKey, meId) {
+  if (chatKey === 'channel') {
+    return users.map(u => u.id);
+  }
   if (chatKey.startsWith('g_')) {
     const g = groups.find(x => x.id === chatKey);
     return g ? g.members.slice() : [];
@@ -188,8 +192,7 @@ app.post('/api/login', (req, res) => {
 });
 
 function meData(u) {
-  const self = userPublic(u, u.id);
-  return self;
+  return userPublic(u, u.id);
 }
 app.get('/api/me', auth, (req, res) => res.json(meData(req.user)));
 
@@ -271,9 +274,7 @@ app.post('/api/send', auth, (req, res) => {
   pushMessage(key, msg);
   saveAll();
 
-  const clients = parts => parts.forEach(id => sendTo(id, { type: 'new_message', data: msg }));
-  clients(participantsOf(key, me.id));
-  if (key.startsWith('ch_')) sendTo(me.id, { type: 'new_message', data: msg });
+  participantsOf(key, me.id).forEach(id => sendTo(id, { type: 'new_message', data: msg }));
   res.json({ msg });
 });
 
@@ -481,7 +482,7 @@ app.post('/api/admin/delete', auth, requireAdmin, (req, res) => {
 /* ---------- WebSocket ---------- */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
-const wsByUser = new Map(); // userId -> Set of ws
+const wsByUser = new Map();
 
 function sendTo(userId, obj) {
   const set = wsByUser.get(userId);
@@ -513,8 +514,7 @@ wss.on('connection', (ws) => {
       const wasOnline = u.online;
       u.online = true;
       saveAll();
-      broadcast({ type: 'presence', id: u.id, online: true, lastSeen: null });
-      if (!wasOnline) broadcast({ type: 'presence', id: u.id, online: true });
+      if (!wasOnline) broadcast({ type: 'presence', id: u.id, online: true, lastSeen: null });
       return;
     }
     if (!ws.userId) return;
@@ -522,7 +522,7 @@ wss.on('connection', (ws) => {
     if (p.type === 'typing') {
       const target = String(p.to || '');
       const meId = ws.userId;
-      if (target.startsWith('g_') || target.startsWith('ch_')) {
+      if (target === 'channel' || target.startsWith('g_') || target.startsWith('ch_')) {
         if (isMemberOf(target, meId)) {
           participantsOf(target, meId).filter(id => id !== meId)
             .forEach(id => sendTo(id, { type: 'typing', chat: target, from: meId }));
@@ -541,6 +541,8 @@ wss.on('connection', (ws) => {
       if (p.sdp) out.sdp = p.sdp;
       if (p.candidate) out.candidate = p.candidate;
       if (p.reason) out.reason = p.reason;
+      if (p.callType) out.callType = p.callType;
+      if (p.duration != null) out.duration = p.duration;
       sendTo(target.id, out);
       /* Записываем звонок в историю, когда кто-то завершил */
       if (p.type === 'call_end') {
@@ -612,5 +614,4 @@ function fmtDur(ms) {
 
 server.listen(PORT, () => {
   console.log('KolGram server работает на порту ' + PORT);
-});
-
+}); 
