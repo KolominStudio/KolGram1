@@ -29,29 +29,6 @@ let groups = load('groups.json', []);
 let channels = load('channels.json', []);
 let tokens = load('tokens.json', {});
 
-/* Миграция: у старых пользователей нет поля contacts.
-   Восстанавливаем контакты из существующих личных переписок. */
-function migrateContacts() {
-  let changed = false;
-  users.forEach(u => {
-    if (!Array.isArray(u.contacts)) { u.contacts = []; changed = true; }
-  });
-  if (changed) {
-    users.forEach(u => {
-      if (u.contacts.length) return;
-      for (const key of Object.keys(messages)) {
-        const parts = key.split('_');
-        if (parts.length !== 2) continue;
-        if (parts.includes(u.id)) {
-          const peer = parts[0] === u.id ? parts[1] : parts[0];
-          if (findUser(peer) && !u.contacts.includes(peer)) u.contacts.push(peer);
-        }
-      }
-    });
-    saveAll();
-  }
-}
-
 function saveAll() {
   save('users.json', users);
   save('messages.json', messages);
@@ -67,7 +44,6 @@ function hashPass(pass, salt) {
 function newId() { return crypto.randomBytes(8).toString('hex'); }
 function privateKey(a, b) { return [a, b].sort().join('_'); }
 function findUser(id) { return users.find(u => u.id === id) || null; }
-function findUserByLogin(login) { return users.find(u => u.login === login) || null; }
 function userPublic(u, forUserId) {
   return {
     id: u.id, login: u.login, name: u.name, color: u.color,
@@ -79,6 +55,7 @@ function userPublic(u, forUserId) {
   };
 }
 
+/* Приватный чат всегда разворачивается в отсортированный ключ */
 function chatKeyOf(target, meId) {
   if (target === 'saved') return 'saved_' + meId;
   if (target === 'channel') return 'channel';
@@ -98,18 +75,12 @@ function isMemberOf(chatKey, meId) {
     if (c.owner_id === meId) return true;
     return (c.subs || []).includes(meId);
   }
-  if (chatKey.startsWith('saved_')) return chatKey === 'saved_' + meId;
-  /* Личный чат: доступ только если собеседник в контактах,
-     либо уже есть история (старые диалоги после миграции) */
-  const [a, b] = chatKey.split('_');
-  const me = findUser(meId);
-  const peerId = a === meId ? b : a;
-  if (me && (me.contacts || []).includes(peerId)) return true;
-  const arr = messages[chatKey];
-  return !!(arr && arr.length);
+  return true;
 }
 function participantsOf(chatKey, meId) {
-  if (chatKey === 'channel') return users.map(u => u.id);
+  if (chatKey === 'channel') {
+    return users.map(u => u.id);
+  }
   if (chatKey.startsWith('g_')) {
     const g = groups.find(x => x.id === chatKey);
     return g ? g.members.slice() : [];
@@ -117,7 +88,8 @@ function participantsOf(chatKey, meId) {
   if (chatKey.startsWith('ch_')) {
     const c = channels.find(x => x.id === chatKey);
     if (!c) return [];
-    return [...new Set([c.owner_id, ...(c.subs || [])])];
+    const set = new Set([c.owner_id, ...(c.subs || [])]);
+    return [...set];
   }
   if (chatKey.startsWith('saved_')) return [chatKey.replace('saved_', '')];
   const [a, b] = chatKey.split('_');
@@ -187,14 +159,13 @@ app.post('/api/register', (req, res) => {
     color: ['#4f8ef7','#8b5cf6','#e05a8a','#d98e4a','#43b97c','#45b8c9'][Math.floor(Math.random() * 6)],
     avatar: null, bio: 'Пользователь KolGram',
     admin: false, verified: false,
-    blocked: null, blockedBy: [], contacts: [],
-    online: false, lastSeen: null,
+    blocked: null, blockedBy: [], online: false, lastSeen: null,
     created: Date.now(),
   };
   users.push(u);
   saveAll();
   broadcast({ type: 'users_changed' });
-  res.json({ ok: true, login: u.login });
+  res.json({ ok: true });
 });
 
 app.post('/api/login', (req, res) => {
@@ -217,52 +188,13 @@ app.post('/api/login', (req, res) => {
   res.json({ token, user: userPublic(u, u.id) });
 });
 
-function meData(u) { return userPublic(u, u.id); }
+function meData(u) {
+  return userPublic(u, u.id);
+}
 app.get('/api/me', auth, (req, res) => res.json(meData(req.user)));
 
-/* НОВОЕ: список пользователей = только мои контакты (без заблокировавших меня) */
 app.get('/api/users', auth, (req, res) => {
-  const meId = req.user.id;
-  const contactIds = req.user.contacts || [];
-  res.json(users
-    .filter(u => u.id !== meId && contactIds.includes(u.id))
-    .filter(u => !(u.blockedBy || []).includes(meId))
-    .map(u => userPublic(u, meId)));
-});
-
-/* НОВОЕ: добавить контакт по username (взаимно) */
-app.post('/api/contacts/add', auth, (req, res) => {
-  const me = req.user;
-  const login = String(req.body.login || '').trim().toLowerCase();
-  if (!login) return res.status(400).json({ error: 'Введите username' });
-  if (login === me.login) return res.status(400).json({ error: 'Это ваш собственный username' });
-  const target = findUserByLogin(login);
-  if (!target) return res.status(404).json({ error: 'Пользователь @' + login + ' не найден' });
-  if (target.blocked) return res.status(403).json({ error: 'Аккаунт заблокирован' });
-  if ((target.blockedBy || []).includes(me.id)) return res.status(403).json({ error: 'Этот пользователь заблокировал вас' });
-  if ((me.blockedBy || []).includes(target.id)) return res.status(403).json({ error: 'Вы заблокировали этого пользователя' });
-  if (!me.contacts) me.contacts = [];
-  if (!target.contacts) target.contacts = [];
-  if (me.contacts.includes(target.id)) return res.status(400).json({ error: 'Этот пользователь уже в вашем списке' });
-  me.contacts.push(target.id);
-  target.contacts.push(me.id);
-  saveAll();
-  sendTo(target.id, { type: 'users_changed' });
-  broadcast({ type: 'users_changed' });
-  res.json({ ok: true, user: userPublic(target, me.id) });
-});
-
-/* НОВОЕ: удалить контакт (взаимно) */
-app.post('/api/contacts/remove', auth, (req, res) => {
-  const me = req.user;
-  const target = findUser(String(req.body.userId || ''));
-  if (!target) return res.status(404).json({ error: 'Пользователь не найден' });
-  me.contacts = (me.contacts || []).filter(id => id !== target.id);
-  target.contacts = (target.contacts || []).filter(id => id !== me.id);
-  saveAll();
-  sendTo(target.id, { type: 'users_changed' });
-  broadcast({ type: 'users_changed' });
-  res.json({ ok: true });
+  res.json(users.filter(u => u.id !== req.user.id).map(u => userPublic(u, req.user.id)));
 });
 
 app.get('/api/chats', auth, (req, res) => {
@@ -298,9 +230,7 @@ app.post('/api/send', auth, (req, res) => {
   const me = req.user;
   const target = String(req.body.to || '');
   const text = String(req.body.text || '').slice(0, 4000);
-  const media = req.body.media && req.body.media.id
-    ? { id: req.body.media.id, type: req.body.media.type || 'image', url: '/uploads/' + req.body.media.id }
-    : null;
+  const media = req.body.media && req.body.media.id ? { id: req.body.media.id, type: req.body.media.type || 'image', url: '/uploads/' + req.body.media.id } : null;
   if (!text && !media) return res.status(400).json({ error: 'Пустое сообщение' });
 
   let key;
@@ -322,10 +252,6 @@ app.post('/api/send', auth, (req, res) => {
   else {
     const peer = findUser(target);
     if (!peer) return res.status(404).json({ error: 'Пользователь не найден' });
-    /* НОВОЕ: писать можно только контактам */
-    if (!(me.contacts || []).includes(peer.id)) {
-      return res.status(403).json({ error: 'Добавьте пользователя по username, чтобы писать' });
-    }
     if (peer.blocked) return res.status(403).json({ error: 'Аккаунт заблокирован' });
     if ((peer.blockedBy || []).includes(me.id)) return res.status(403).json({ error: 'Этот пользователь заблокировал вас' });
     if ((me.blockedBy || []).includes(peer.id)) return res.status(403).json({ error: 'Вы заблокировали этого пользователя' });
@@ -379,13 +305,12 @@ app.post('/api/msg/delete', auth, (req, res) => {
   res.status(404).json({ error: 'Сообщение не найдено' });
 });
 
-/* Медиа: фото, видео и НОВОЕ — аудио (голосовые) */
+/* Медиа */
 app.post('/api/media', auth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Файл не получен' });
-  const mime = req.file.mimetype || '';
-  const type = mime.startsWith('video/') ? 'video' : mime.startsWith('audio/') ? 'audio' : 'image';
+  const isVideo = (req.file.mimetype || '').startsWith('video/');
   const id = req.file.filename;
-  res.json({ id, type, url: '/uploads/' + id });
+  res.json({ id, type: isVideo ? 'video' : 'image', url: '/uploads/' + id });
 });
 
 /* Профиль */
@@ -497,10 +422,6 @@ function requireAdmin(req, res, next) {
   if (!req.user.admin) return res.status(403).json({ error: 'Только для администратора' });
   next();
 }
-/* НОВОЕ: админу доступен полный список пользователей */
-app.get('/api/admin/users', auth, requireAdmin, (req, res) => {
-  res.json(users.map(u => userPublic(u, req.user.id)));
-});
 app.post('/api/admin/block', auth, requireAdmin, (req, res) => {
   const u = findUser(String(req.body.userId || ''));
   if (!u) return res.status(404).json({ error: 'Пользователь не найден' });
@@ -535,7 +456,6 @@ app.post('/api/admin/delete', auth, requireAdmin, (req, res) => {
   if (u.admin) return res.status(400).json({ error: 'Админа удалить нельзя' });
   sendTo(u.id, { type: 'kicked' });
   users = users.filter(x => x.id !== u.id);
-  users.forEach(x => x.contacts = (x.contacts || []).filter(id => id !== u.id));
   groups.forEach(g => g.members = g.members.filter(id => id !== u.id));
   groups = groups.filter(g => g.members.length > 0);
   channels = channels.filter(c => c.owner_id !== u.id);
@@ -679,16 +599,13 @@ function fmtDur(ms) {
       salt, passHash: hashPass(ADMIN_PASS, salt),
       color: '#4f8ef7', avatar: null, bio: 'Администратор KolGram',
       admin: true, verified: true, blocked: null, blockedBy: [],
-      contacts: [], online: false, lastSeen: null, created: Date.now(),
+      online: false, lastSeen: null, created: Date.now(),
     };
     users.push(admin);
   }
   if (!admin.admin) admin.admin = true;
-  if (!Array.isArray(admin.contacts)) admin.contacts = [];
   saveAll();
 })();
-
-migrateContacts();
 
 server.listen(PORT, () => {
   console.log('KolGram server работает на порту ' + PORT);
